@@ -1,0 +1,9 @@
+.claude/
+.idea/
+.serena/
+hershim/
+playlists/
+*.xls
+*.exe
+report.rb
+report.db
