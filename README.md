@@ -1,6 +1,6 @@
 # Usage:
 ```bash
-report.exe -s 2025-05-01 -f 2025-05-31 -r report-2025-05.xls -t tali-2025-05.xls -p playlists -e hershim
+report.exe -s 2025-07-01 -f 2025-07-31 -r report-2025-07.xls -t tali-2025-07.xls -p "p:\_TV\playlist\3_archive\2025" -e "p:\_tv\Hershim\Ahrei avoda\backup"
 ```
 where:
 * s - start date (from 00:00)

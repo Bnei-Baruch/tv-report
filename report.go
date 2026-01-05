@@ -2,6 +2,7 @@ package main
 
 // To compile:
 // GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o report.exe report.go
+// GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o /media/sf_D_DRIVE/projects/report/report.exe report.go
 
 import (
 	"bufio"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,6 +138,11 @@ type playlistResult struct {
 	events []OptimizedEvent
 	times  []time.Time
 	err    error
+}
+
+type eventWithTime struct {
+	event OptimizedEvent
+	time  time.Time
 }
 
 // initRegexes compiles all regular expressions once
@@ -332,28 +339,43 @@ func (p *Playlist) Parse() error {
 	}()
 
 	// Collect and process results
-	var allEvents []OptimizedEvent
-	var allTimes []time.Time
+	var combinedEvents []eventWithTime
 
 	for result := range results {
 		if result.err != nil {
 			cancel()
 			return result.err
 		}
-		allEvents = append(allEvents, result.events...)
-		allTimes = append(allTimes, result.times...)
+		// Combine events with their times
+		for i, event := range result.events {
+			if i < len(result.times) {
+				combinedEvents = append(combinedEvents, eventWithTime{
+					event: event,
+					time:  result.times[i],
+				})
+			}
+		}
+	}
+
+	// Sort events by time
+	sort.Slice(combinedEvents, func(i, j int) bool {
+		return combinedEvents[i].time.Before(combinedEvents[j].time)
+	})
+
+	// Extract sorted events for database processing
+	var allEvents []OptimizedEvent
+	for _, combined := range combinedEvents {
+		allEvents = append(allEvents, combined.event)
 	}
 
 	// Batch process database operations
-	if err := p.batchProcessEvents(allEvents); err != nil {
+	if err = p.batchProcessEvents(allEvents); err != nil {
 		return err
 	}
 
-	// Output results
-	for i, event := range allEvents {
-		if i < len(allTimes) {
-			p.printOptimizedEvent(&event, allTimes[i])
-		}
+	// Output results in chronological order
+	for i, combined := range combinedEvents {
+		p.printOptimizedEvent(&allEvents[i], combined.time)
 	}
 
 	if !superVerbose {
@@ -790,14 +812,50 @@ func (p *Playlist) printOptimizedEvent(event *OptimizedEvent, t time.Time) {
 		tali:                 p.taliWriter,
 	}
 
-	e.printRow(t)
+	// Print tali output once per original event (no splitting)
+	e.printTaliSimple(t)
+
+	// Print report output with splitting logic
+	e.printRowReport(t)
+}
+
+// isWindowsAbsolutePath checks if path is Windows absolute path
+func isWindowsAbsolutePath(path string) bool {
+	// Check for drive letter format: C:\ or C:/ or just C:
+	if len(path) >= 2 && path[1] == ':' &&
+		((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+		return true
+	}
+	// Check for UNC path: \\server\share
+	if len(path) >= 2 && path[0] == '\\' && path[1] == '\\' {
+		return true
+	}
+	return false
 }
 
 // getHershimMapOptimized creates hershim map with streaming processing
 func getHershimMapOptimized(hershimDir string) (map[string]bool, error) {
 	hershimMap := make(map[string]bool)
 
-	err := filepath.Walk(hershimDir, func(path string, info os.FileInfo, err error) error {
+	// Handle Windows paths properly
+	targetPath := hershimDir
+	if runtime.GOOS == "windows" && isWindowsAbsolutePath(hershimDir) {
+		// Use the path as-is for Windows absolute paths
+		targetPath = filepath.Clean(hershimDir)
+	} else if !filepath.IsAbs(hershimDir) {
+		var err error
+		targetPath, err = filepath.Abs(hershimDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Check if directory exists
+	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
+		return nil, err
+	}
+
+	err := filepath.Walk(targetPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			// Continue processing even if some files are inaccessible
 			return nil
@@ -817,7 +875,25 @@ func getPlaylistFilesOptimized(playlistsDir string, start, finish time.Time) ([]
 	var playlists []playlistEntry
 	startFile := start.AddDate(0, 0, -1)
 
-	err := filepath.Walk(playlistsDir, func(path string, info os.FileInfo, err error) error {
+	// Handle Windows paths properly
+	targetPath := playlistsDir
+	if runtime.GOOS == "windows" && isWindowsAbsolutePath(playlistsDir) {
+		// Use the path as-is for Windows absolute paths
+		targetPath = filepath.Clean(playlistsDir)
+	} else if !filepath.IsAbs(playlistsDir) {
+		var err error
+		targetPath, err = filepath.Abs(playlistsDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Check if directory exists
+	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
+		return nil, err
+	}
+
+	err := filepath.Walk(targetPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Continue processing
 		}
@@ -856,8 +932,8 @@ func getPlaylistFilesOptimized(playlistsDir string, start, finish time.Time) ([]
 	return playlists, err
 }
 
-// All original Event methods (printRow, printTaliSimple, printOneLineReport)
-func (e *Event) printRow(t time.Time) {
+// printRowReport handles report output with splitting logic (separated from tali output)
+func (e *Event) printRowReport(t time.Time) {
 	e.tooShort = e.length < 10 && !regexp.MustCompile(`_program_|_lesson_`).MatchString(e.longFilename)
 	e.saturday = t.Weekday() == time.Saturday
 
@@ -867,10 +943,7 @@ func (e *Event) printRow(t time.Time) {
 		fmt.Fprintf(os.Stderr, "%s %s %s %f\n", t.Format("2006-01-02 15:04:05"), e.name, e.title, e.length)
 	}
 
-	// For Tali output, always print the full event without splitting
-	e.printTaliSimple(t)
-
-	// For Report output, keep the existing prime time splitting logic
+	// Report output with prime time splitting logic
 	if inTimeRange(t, primeTimeStart, primeTimeEnd) {
 		if inTimeRange(lengthSec, primeTimeStart, primeTimeEnd) {
 			if superVerbose {
@@ -954,6 +1027,10 @@ func (e *Event) printRow(t time.Time) {
 }
 
 func (e *Event) printTaliSimple(t time.Time) {
+	// Set event properties needed for consistent data
+	e.tooShort = e.length < 10 && !regexp.MustCompile(`_program_|_lesson_`).MatchString(e.longFilename)
+	e.saturday = t.Weekday() == time.Saturday
+
 	nameVal := e.name
 	titleVal := e.title
 	if nameVal == "" || nameVal == "Not defined" {
@@ -1217,6 +1294,17 @@ func main() {
 	var superVerboseFlag = flag.Bool("V", false, "super verbose output")
 
 	flag.Parse()
+
+	// Debug: print all flag values
+	log.Printf("Flag values parsed:")
+	log.Printf("  -s (start): %s", *startStr)
+	log.Printf("  -f (finish): %s", *finishStr)
+	log.Printf("  -r (report): %s", *reportName)
+	log.Printf("  -t (tali): %s", *taliName)
+	log.Printf("  -p (playlists): %s", *playlistsDir)
+	log.Printf("  -e (hershim): %s", *hershimDir)
+	log.Printf("  -v (verbose): %t", *verboseFlag)
+	log.Printf("  -V (super verbose): %t", *superVerboseFlag)
 
 	verbose = *verboseFlag
 	superVerbose = *superVerboseFlag
